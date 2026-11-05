@@ -317,10 +317,9 @@ where
                                             // gets its content_block_stop, so its arguments are
                                             // incomplete and the call cannot be delivered. Say so
                                             // rather than ending as if the turn were empty.
-                                            if let Some(tool_call) = current_tool_call.take() {
+                                            if current_tool_call.take().is_some() {
                                                 yield Err(unfinished_tool_call_error(
                                                     delta.stop_reason.as_deref().unwrap_or_default(),
-                                                    &tool_call,
                                                 ));
                                             }
                                             break;
@@ -366,18 +365,18 @@ where
 }
 
 /// The error for a tool call whose message stopped before its content block
-/// closed. Names the tool but not the call id: callers classify provider
-/// errors by substring, and a random id can contain digits such as `503`.
-fn unfinished_tool_call_error(stop_reason: &str, tool_call: &ToolCallState) -> CompletionError {
+/// closed. Leaves out the tool name and call id: this crate and its callers
+/// classify provider errors by substring, so a name such as `list_aborted_jobs`
+/// would read as a cancellation and an id containing `503` as an outage.
+fn unfinished_tool_call_error(stop_reason: &str) -> CompletionError {
     let hint = if stop_reason == "max_tokens" {
         " Raise max_tokens or ask for a smaller tool input."
     } else {
         ""
     };
     CompletionError::ProviderError(format!(
-        "Anthropic stopped the message ({stop_reason}) while streaming the arguments of tool \
-         call `{}`; the incomplete call was dropped.{hint}",
-        tool_call.name
+        "Anthropic stopped the message ({stop_reason}) while streaming the arguments of a tool \
+         call; the incomplete call was dropped.{hint}"
     ))
 }
 
@@ -960,7 +959,7 @@ mod tests {
 
     /// mezmo/aura#591: a message cut off by max_tokens inside a tool_use block
     /// gets no content_block_stop for it. The incomplete call must surface as
-    /// an error naming the tool, not vanish into an empty turn.
+    /// an error, not vanish into an empty turn.
     #[tokio::test]
     async fn a_tool_call_cut_off_by_max_tokens_is_an_error() {
         let stop = message_delta("max_tokens");
@@ -979,10 +978,9 @@ mod tests {
             .collect();
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("max_tokens"), "{}", errors[0]);
-        assert!(errors[0].contains("`respond_directly`"), "{}", errors[0]);
         assert!(
-            !errors[0].contains("toolu_01"),
-            "the call id stays out of the message: {}",
+            !errors[0].contains("toolu_01") && !errors[0].contains("respond_directly"),
+            "the call id and tool name stay out of the message: {}",
             errors[0]
         );
         assert!(
@@ -991,6 +989,29 @@ mod tests {
                 .any(|item| matches!(item, Ok(streaming::StreamedAssistantContent::ToolCall(_)))),
             "the incomplete call must not be delivered"
         );
+        assert_eq!(
+            final_response(&items).stop_reason.as_deref(),
+            Some("max_tokens")
+        );
+    }
+
+    /// The stream treats a provider error containing `aborted` as a cancellation
+    /// and ends quietly, so a tool name with that word must not hide the error.
+    #[tokio::test]
+    async fn a_cut_off_tool_call_named_aborted_still_reports_the_error() {
+        let stop = message_delta("max_tokens");
+        let tool_use_start = TOOL_USE_START.replace("respond_directly", "list_aborted_jobs");
+        let items = stream_events(&[
+            MESSAGE_START,
+            &tool_use_start,
+            PARTIAL_ARGS,
+            &stop,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+
+        let errors = items.iter().filter(|item| item.is_err()).count();
+        assert_eq!(errors, 1, "the error must reach the caller: {items:?}");
         assert_eq!(
             final_response(&items).stop_reason.as_deref(),
             Some("max_tokens")
